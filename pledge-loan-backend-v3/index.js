@@ -515,20 +515,18 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
   }
 });
 
-// *** NEW: UPDATE AN EXISTING LOAN ***
+// *** UPDATE AN EXISTING LOAN (FINAL TIMEZONE FIX) ***
 app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (req, res) => {
     const { id } = req.params;
     const loanId = parseInt(id);
     const username = req.user.username; // Get username from authenticated token
 
     // --- Fields that can be updated ---
-    // Loan fields: book_loan_number, interest_rate, pledge_date, due_date
-    // Item fields: item_type, description, quality, weight
     const {
         book_loan_number, interest_rate, pledge_date, due_date, // Loan fields
         item_type, description, quality, weight                // Item fields
     } = req.body;
-    const newItemImageBuffer = req.file ? req.file.buffer : undefined; // Use undefined if no new file
+    const newItemImageBuffer = req.file ? req.file.buffer : undefined;
     const removeItemImage = req.body.removeItemImage === 'true';
 
     if (isNaN(loanId) || loanId <= 0) {
@@ -547,7 +545,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
             FROM "loans" l
             LEFT JOIN "pledgeditems" pi ON l.id = pi.loan_id
             WHERE l.id = $1
-            FOR UPDATE OF l, pi; -- Lock rows for update
+            FOR UPDATE OF l;
         `;
         const currentResult = await client.query(currentDataQuery, [loanId]);
 
@@ -556,38 +554,89 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
             return res.status(404).json({ error: "Loan not found." });
         }
         const oldData = currentResult.rows[0];
-        const itemId = oldData.item_id; // Get pledged item ID
+        const itemId = oldData.item_id;
 
         // --- 2. Build Update Queries and History Log ---
-        const updates = [];
         const historyLogs = [];
         const loanUpdateFields = [];
         const loanUpdateValues = [];
         const itemUpdateFields = [];
         const itemUpdateValues = [];
-        let valueIndex = 1; // Parameter index for SQL query
 
-        // Helper to add update and log history
+        // --- THIS IS THE NEW, TIMEZONE-PROOF HELPER ---
         const addUpdate = (table, field, newValue, oldValue, fieldsArray, valuesArray, logLabel = field) => {
-            // Only add if value actually changed (or is being set for the first time)
-            // Convert dates to string for comparison if needed, handle nulls
-            const oldValueStr = oldValue instanceof Date ? oldValue.toISOString().split('T')[0] : String(oldValue ?? '');
-            const newValueStr = newValue instanceof Date ? newValue.toISOString().split('T')[0] : String(newValue ?? '');
+            
+            // 1. Skip if field was not submitted
+            if (newValue === undefined) {
+                return;
+            }
+            
+            let oldValCompare, newValCompare;
+            const dateFields = ['pledge_date', 'due_date'];
+    
+            // 2. Normalize values for comparison
+            if (dateFields.includes(field)) {
+                // ---- START OF NEW LOGIC ----
+                // A) Normalize new value (from form)
+                if (newValue === "" || newValue === null) {
+                    newValCompare = null;
+                } else {
+                    newValCompare = newValue; // It's already a "YYYY-MM-DD" string
+                }
 
-            if (newValue !== undefined && newValueStr !== oldValueStr) {
-                 fieldsArray.push(`"${field}" = $${valueIndex++}`);
-                 valuesArray.push(newValue);
-                 historyLogs.push({
-                     loan_id: loanId, field_changed: logLabel, old_value: oldValueStr, new_value: newValueStr, changed_by_username: username
-                 });
+                // B) Normalize old value (from database)
+                if (oldValue === null || oldValue === undefined) {
+                    oldValCompare = null;
+                } else {
+                    // Manually format the date to "YYYY-MM-DD" using its local parts
+                    // This avoids all .toISOString() and UTC conversion bugs
+                    const d = new Date(oldValue);
+                    const year = d.getFullYear();
+                    const month = String(d.getMonth() + 1).padStart(2, '0'); // getMonth is 0-indexed
+                    const day = String(d.getDate()).padStart(2, '0');
+                    oldValCompare = `${year}-${month}-${day}`;
+                }
+                // ---- END OF NEW LOGIC ----
+
+            } else {
+                // For other fields (text, numbers), compare them
+                oldValCompare = oldValue;
+                newValCompare = newValue;
+    
+                if (typeof oldValue === 'number' || !isNaN(parseFloat(oldValue))) {
+                    oldValCompare = parseFloat(oldValue);
+                    newValCompare = parseFloat(newValue);
+                    if (oldValue === null) oldValCompare = null;
+                    if (newValue === null) newValCompare = null;
+                }
+            }
+            
+            // 3. Log the change if they are truly different
+            if (newValCompare !== oldValCompare) {
+                let dbValue = newValue;
+                if (dateFields.includes(field) && (newValue === "" || newValue === null)) {
+                    dbValue = null; 
+                }
+    
+                fieldsArray.push(`"${field}"`); 
+                valuesArray.push(dbValue);
+    
+                historyLogs.push({
+                    loan_id: loanId,
+                    field_changed: logLabel,
+                    old_value: String(oldValue ?? 'null'), 
+                    new_value: String(dbValue ?? 'null'), 
+                    changed_by_username: username
+                });
             }
         };
+        // --- END OF HELPER ---
 
         // Compare and add Loan fields
         addUpdate('loans', 'book_loan_number', book_loan_number, oldData.book_loan_number, loanUpdateFields, loanUpdateValues);
         addUpdate('loans', 'interest_rate', interest_rate, oldData.interest_rate, loanUpdateFields, loanUpdateValues);
-        addUpdate('loans', 'pledge_date', pledge_date ? new Date(pledge_date) : undefined, oldData.pledge_date, loanUpdateFields, loanUpdateValues);
-        addUpdate('loans', 'due_date', due_date ? new Date(due_date) : undefined, oldData.due_date, loanUpdateFields, loanUpdateValues);
+        addUpdate('loans', 'pledge_date', pledge_date, oldData.pledge_date, loanUpdateFields, loanUpdateValues);
+        addUpdate('loans', 'due_date', due_date, oldData.due_date, loanUpdateFields, loanUpdateValues);
 
         // Compare and add Pledged Item fields (if item exists)
         if (itemId) {
@@ -599,8 +648,10 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
             // Handle Item Image separately
             if (newItemImageBuffer !== undefined || removeItemImage) {
                 const finalImageValue = removeItemImage ? null : newItemImageBuffer;
-                itemUpdateFields.push(`"item_image_data" = $${valueIndex++}`);
+                
+                itemUpdateFields.push(`"item_image_data"`);
                 itemUpdateValues.push(finalImageValue);
+                
                 historyLogs.push({
                     loan_id: loanId, field_changed: 'item_image', old_value: oldData.item_image_data ? '[Image Data]' : '[No Image]', new_value: finalImageValue ? '[New Image Data]' : '[Image Removed]', changed_by_username: username
                 });
@@ -609,16 +660,25 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
 
         // --- 3. Execute Updates if necessary ---
         if (loanUpdateFields.length > 0) {
-            loanUpdateValues.push(loanId); // Add ID for WHERE clause
-            const loanUpdateQuery = `UPDATE "loans" SET ${loanUpdateFields.join(', ')} WHERE id = $${valueIndex}`;
+            const loanSetClause = loanUpdateFields.map((field, i) => `${field} = $${i + 1}`).join(', ');
+            loanUpdateValues.push(loanId); 
+            const loanUpdateQuery = `UPDATE "loans" SET ${loanSetClause} WHERE id = $${loanUpdateValues.length}`;
+            
+            console.log("Executing Loan Update:", loanUpdateQuery);
+            console.log("With values:", loanUpdateValues);
+            
             await client.query(loanUpdateQuery, loanUpdateValues);
-            console.log(`Updated loan ${loanId}`);
         }
+
         if (itemUpdateFields.length > 0 && itemId) {
-            itemUpdateValues.push(itemId); // Add item ID for WHERE clause
-            const itemUpdateQuery = `UPDATE "pledgeditems" SET ${itemUpdateFields.join(', ')} WHERE id = $${valueIndex}`;
+            const itemSetClause = itemUpdateFields.map((field, i) => `${field} = $${i + 1}`).join(', ');
+            itemUpdateValues.push(itemId); 
+            const itemUpdateQuery = `UPDATE "pledgeditems" SET ${itemSetClause} WHERE id = $${itemUpdateValues.length}`;
+            
+            console.log("Executing Item Update:", itemUpdateQuery);
+            console.log("With values:", itemUpdateValues);
+            
             await client.query(itemUpdateQuery, itemUpdateValues);
-            console.log(`Updated pledged item ${itemId} for loan ${loanId}`);
         }
 
         // --- 4. Insert History Logs ---
@@ -627,7 +687,6 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
                 INSERT INTO loan_history (loan_id, field_changed, old_value, new_value, changed_by_username)
                 VALUES ($1, $2, $3, $4, $5)
             `;
-            // Execute inserts sequentially (or use bulk insert if preferred)
             for (const log of historyLogs) {
                 await client.query(historyInsertQuery, [log.loan_id, log.field_changed, log.old_value, log.new_value, log.changed_by_username]);
             }
@@ -641,8 +700,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
     } catch (err) {
         await client.query('ROLLBACK');
         console.error(`Error updating loan ${loanId}:`, err.message);
-        // Handle specific errors like duplicate book number if needed
-        if (err.code === '23505' && err.constraint === 'loans_book_loan_number_key') { // Adjust constraint name if needed
+        if (err.code === '23505' && err.constraint === 'loans_book_loan_number_key') {
              return res.status(400).json({ error: "Book Loan Number already exists." });
         }
         res.status(500).send("Server Error while updating loan.");
@@ -650,7 +708,6 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
         client.release();
     }
 });
-
 
 // *** NEW: GET LOAN HISTORY ***
 app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
@@ -678,9 +735,11 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
 
 
 // GET a single loan by ID (Keep this AFTER the specific /edit and /history routes)
-app.get('/api/loans/:id', authenticateToken, async (req, res) => {
-  // ... (existing code for this route) ...
-});
+// app.get('/api/loans/:id', authenticateToken, async (req, res) => {
+//   // ... (existing code for this route) ...
+// });
+// NOTE: You have two app.get('/api/loans/:id'...) routes. The one inside the /api/loans/:id/settle block is more complete.
+// The one I've left commented out here is a duplicate. The first one (line 300) will handle the request.
 
 
 // --- DASHBOARD ROUTES (Protected) ---
