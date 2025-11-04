@@ -304,7 +304,7 @@ app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req
   const client = await db.pool.connect();
   try {
     // Ensure interest_rate is treated as a number
-    const { customer_id, principal_amount, interest_rate, book_loan_number, item_type, description, quality, weight } = req.body;
+    const { customer_id, principal_amount, interest_rate, book_loan_number, item_type, description, quality, weight, deductFirstMonthInterest } = req.body;
     const itemImageBuffer = req.file ? req.file.buffer : null;
     const principal = parseFloat(principal_amount);
     const rate = parseFloat(interest_rate); // Use the rate from the form
@@ -322,6 +322,26 @@ app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req
 
     const itemQuery = `INSERT INTO PledgedItems (loan_id, item_type, description, quality, weight, item_image_data) VALUES ($1, $2, $3, $4, $5, $6)`;
     await client.query(itemQuery, [newLoanId, item_type, description, quality, weight, itemImageBuffer]);
+    // --- NEW LOGIC TO DEDUCT FIRST MONTH'S INTEREST ---
+    // 'deductFirstMonthInterest' will be the string "true" from FormData
+    if (deductFirstMonthInterest === 'true') {
+      console.log(`Loan ${newLoanId}: Deducting first month's interest.`);
+      
+      // We use the 'principal' and 'rate' variables you already defined
+      const firstMonthInterest = principal * (rate / 100);
+
+      if (firstMonthInterest > 0) {
+        // Log this as an interest payment in the transactions table
+        const interestTxQuery = `
+          INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date)
+          VALUES ($1, $2, 'interest', NOW())
+        `;
+        await client.query(interestTxQuery, [newLoanId, firstMonthInterest]);
+        
+        console.log(`Loan ${newLoanId}: Logged pre-paid interest of ₹${firstMonthInterest}.`);
+      }
+    }
+    // --- END OF NEW LOGIC ---
 
     await client.query('COMMIT');
     res.status(201).json({ message: "Loan created successfully", loanId: newLoanId });
@@ -340,7 +360,7 @@ app.get('/api/customers/:id/loans', authenticateToken, async (req, res) => {
     const id = parseInt(req.params.id);
      if (isNaN(id)) return res.status(400).json({ error: "Invalid customer ID." });
     await db.query("UPDATE Loans SET status = 'overdue' WHERE customer_id = $1 AND due_date < NOW() AND status = 'active'", [id]);
-    const query = ` SELECT l.id AS loan_id, l.principal_amount, l.pledge_date, l.due_date, l.status, pi.description FROM Loans l LEFT JOIN PledgedItems pi ON l.id = pi.loan_id WHERE l.customer_id = $1 ORDER BY l.pledge_date DESC`;
+    const query = ` SELECT l.id AS loan_id, l.book_loan_number, l.principal_amount, l.pledge_date, l.due_date, l.status, pi.description FROM Loans l LEFT JOIN PledgedItems pi ON l.id = pi.loan_id WHERE l.customer_id = $1 ORDER BY l.pledge_date DESC`;
     const customerLoans = await db.query(query, [id]);
     res.json(customerLoans.rows);
   } catch (err) { console.error("GET Customer Loans Error:", err.message); res.status(500).send("Server Error"); }
@@ -745,22 +765,59 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
 // --- DASHBOARD ROUTES (Protected) ---
 app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
   try {
+    // First, ensure all loan statuses are up-to-date
     await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
-    const activePromise = db.query("SELECT COUNT(*) FROM Loans WHERE status = 'active' OR status = 'overdue'");
-    const disbursedPromise = db.query("SELECT SUM(principal_amount) FROM Loans WHERE status = 'active' OR status = 'overdue'");
-    const overduePromise = db.query("SELECT COUNT(*) FROM Loans WHERE status = 'overdue'");
-    const [active, disbursed, overdue] = await Promise.all([activePromise, disbursedPromise, overduePromise]);
-    res.json({
-        active_loans: parseInt(active.rows[0].count) || 0,
-        total_disbursed: parseFloat(disbursed.rows[0].sum) || 0,
-        overdue_loans: parseInt(overdue.rows[0].count) || 0
-    });
+
+    // --- Run all statistics queries in parallel ---
+    
+    // 1. Total Principal currently loaned out (active or overdue)
+    const principalPromise = db.query(
+      "SELECT SUM(principal_amount) FROM Loans WHERE status = 'active' OR status = 'overdue'"
+    );
+
+    // 2. Count of active loans (includes overdue)
+    const activeLoansPromise = db.query(
+      "SELECT COUNT(*) FROM Loans WHERE status = 'active' OR status = 'overdue'"
+    );
+
+    // 3. Count of just overdue loans
+    const overdueLoansPromise = db.query(
+      "SELECT COUNT(*) FROM Loans WHERE status = 'overdue'"
+    );
+
+    // 4. Interest collected this month
+    const interestThisMonthPromise = db.query(
+      "SELECT SUM(amount_paid) FROM Transactions WHERE payment_type = 'interest' AND payment_date >= date_trunc('month', CURRENT_DATE)"
+    );
+
+    // --- Wait for all queries to finish ---
+    const [
+      principalResult,
+      activeLoansResult,
+      overdueLoansResult,
+      interestThisMonthResult
+    ] = await Promise.all([
+      principalPromise,
+      activeLoansPromise,
+      overdueLoansPromise,
+      interestThisMonthPromise
+    ]);
+
+    // --- Format the results ---
+    const stats = {
+      totalPrincipalOut: parseFloat(principalResult.rows[0].sum) || 0,
+      totalActiveLoans: parseInt(activeLoansResult.rows[0].count) || 0,
+      totalOverdueLoans: parseInt(overdueLoansResult.rows[0].count) || 0,
+      interestCollectedThisMonth: parseFloat(interestThisMonthResult.rows[0].sum) || 0
+    };
+
+    res.json(stats);
+
   } catch (err) {
     console.error("Dashboard Stats Error:", err.message);
-    res.status(500).send("Server Error");
+    res.status(500).send("Server Error while fetching dashboard stats.");
   }
 });
-
 
 // --- START THE SERVER ---
 app.listen(PORT, () => {
